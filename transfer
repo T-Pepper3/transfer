@@ -1,0 +1,90 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/mutex.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include "elevator.h"
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Elevator Kernel");
+
+static struct task_struct* elevatorThread;
+static struct mutex elevatorMutex;
+static bool keepRunning = true;
+
+struct elevator* dormElevator = NULL;
+static struct proc_dir_entry* proc_entry;
+
+extern int (*STUB_start_elevator)(void);
+extern int (*STUB_issue_request)(int, int, int);
+extern int (*STUB_stop_elevator)(void);
+
+const int weights[] = { 100, 150, 200, 250 };
+
+static int elevatorControl(void* data);
+static void loadPassengers(void);
+static void unloadPassengers(void);
+static int start_elevator(void);
+static int issue_request(int startLevel, int destinationLevel, int type);
+static int stop_elevator(void);
+static int procShow(struct seq_file* m, void* v);
+
+int (*STUB_start_elevator)(void) = start_elevator;
+int (*STUB_issue_request)(int, int, int) = issue_request;
+int (*STUB_stop_elevator)(void) = stop_elevator;
+
+static int procOpen(struct inode* inode, struct file* file) {
+    return single_open(file, procShow, NULL);
+}
+
+static const struct proc_ops proc_file_ops = {
+    .proc_open = procOpen,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static int procShow(struct seq_file* m, void* v) {
+    static const char* state_names[] = { "OFFLINE", "IDLE", "LOADING", "UP", "DOWN" };
+    int floor;
+
+    mutex_lock(&elevatorMutex);
+
+    seq_printf(m, "Elevator state: %s\n", state_names[dormElevator->state]);
+    seq_printf(m, "Current floor: %d\n", dormElevator->currentLevel);
+    seq_printf(m, "Current load: %d lbs\n", dormElevator->weight);
+
+    seq_printf(m, "Elevator passengers: ");
+    struct passenger* p = dormElevator->passengerList;
+    while (p) {
+        char type_char = "FOJS"[p->type];
+        seq_printf(m, "%c%d ", type_char, p->destinationLevel);
+        p = p->next;
+    }
+    seq_printf(m, "\n");
+
+    for (floor = MINFLOOR; floor <= MAXFLOOR; floor++) {
+        seq_printf(m, "[%s] Floor %d: %d ",
+            dormElevator->currentLevel == floor ? "*" : " ",
+            floor, dormElevator->waitingPassengers[floor]);
+
+        p = dormElevator->line[floor];
+        while (p) {
+            char type_char = "FOJS"[p->type];
+            seq_printf(m, "%c%d ", type_char, p->destinationLevel);
+            p = p->next;
+        }
+        seq_printf(m, "\n");
+    }
+
+    seq_printf(m, "Number of passengers: %d\n", dormElevator->passengers);
+    seq_printf(m, "Number of passengers waiting: %d\n", dormElevator->waiting);
+    seq_printf(m, "Number of passengers serviced: %d\n", dormElevator->serviced);
+
+    mutex_unlock(&elevatorMutex);
+    return 0;
+}
